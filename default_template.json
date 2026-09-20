@@ -38,5 +38,16 @@
     "cookies": "",
     "show_body_text": true,
     "video_send_mode": "first"
+  },
+  {
+    "__template_key": "metube",
+    "enable": false,
+    "use_proxy": false,
+    "metube_url": "http://192.168.1.202:8081",
+    "video_quality": "720",
+    "video_codec": "h264",
+    "video_format": "mp4",
+    "wait_timeout": 600,
+    "delete_after_fetch": true
   }
 ]
