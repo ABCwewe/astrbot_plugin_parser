@@ -733,9 +733,20 @@
                         "type": "string",
                         "default": "http://192.168.1.202:8081"
                     },
+                    "add_timeout": {
+                        "description": "提交请求超时秒数",
+                        "hint": "Metube 同步解析链接期间可能长时间不响应；超时不会导致解析失败，插件会转入后台等待任务出现（由等待下载超时统一兜底），仅影响快速识别服务不可达",
+                        "type": "int",
+                        "slider": {
+                            "min": 15,
+                            "max": 300,
+                            "step": 15
+                        },
+                        "default": 60
+                    },
                     "video_quality": {
-                        "description": "目标分辨率",
-                        "hint": "传给 Metube 的画质（quality）",
+                        "description": "清晰度上限",
+                        "hint": "先尝试该档，预估体积超过资源大小上限时自动逐级回退到不超限的最高档",
                         "type": "string",
                         "options": [
                             "best",
