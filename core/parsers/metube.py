@@ -101,7 +101,7 @@ class MetubeParser(BaseParser):
             return 0.0
         if ts > 1e17:  # 纳秒
             ts /= 1e9
-        elif ts > 1e14:  # 毫秒
+        elif ts > 1e11:  # 毫秒
             ts /= 1e3
         return ts
 
@@ -297,6 +297,11 @@ class MetubeParser(BaseParser):
             if entry and entry.get("url"):
                 await self._delete_download(entry["url"], "queue")
                 cancelled.add(entry["url"])
+            # 条目尚未入队时，分别按提交 URL 与服务端规范化 URL 预取消，
+            # 覆盖 youtu.be/shorts 等提交形式与 webpage_url 规范形不一致的情况
+            if submit_url not in cancelled:
+                await self._delete_download(submit_url, "queue")
+                cancelled.add(submit_url)
             if video_id:
                 canonical = f"https://www.youtube.com/watch?v={video_id}"
                 if canonical not in cancelled:
@@ -344,6 +349,11 @@ class MetubeParser(BaseParser):
         except ClientError as e:
             await safe_unlink(file_path)
             raise DownloadException(f"从 Metube 取回视频失败: {e}") from e
+        except OSError as e:
+            # 缓存目录不可写/磁盘满等本地文件系统错误：
+            # 清理残缺文件并转为 DownloadException，让外层继续执行 Metube 取消清理
+            await safe_unlink(file_path)
+            raise DownloadException(f"写入缓存文件失败: {e}") from e
         return file_path
 
     @staticmethod
@@ -475,8 +485,12 @@ class MetubeParser(BaseParser):
     def _quality_ladder(self) -> list[str]:
         """从配置的清晰度上限向下构造回退梯度"""
         top = str(self.mycfg.video_quality or "720")
-        if top in ("best", "worst"):
-            # Metube 对 best/worst 均不加分辨率限制，先试不限档再逐级降
+        if top == "worst":
+            # worst 语义为最低画质：直接取 Metube 最低枚举档，不再向上回退
+            # （Metube 自身对 worst 不加分辨率限制，等价于 best，需单独处理）
+            return ["240"]
+        if top == "best":
+            # best 不加分辨率限制，先试不限档再逐级降
             return ["best", *self.QUALITY_LADDER]
         cap = int(top)
         return [q for q in self.QUALITY_LADDER if int(q) <= cap]
