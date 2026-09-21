@@ -16,8 +16,8 @@ class ShipinhaoParser(BaseParser):
     """微信视频号解析器
 
     纯服务端解析思路（无需 MITM / WASM 解密）：
-    1. 把分享短链 (weixin.qq.com/sph/xxx) POST 给腾讯元宝的解析接口，
-       换取带 token + eid 的 playable_url（需登录态 Cookie）；
+    1. 若为分享短链 (weixin.qq.com/sph/xxx)，先预解析跟随 301 重定向获取 finder-preview 长链（失败则回退原始链接），
+       再 POST 给腾讯元宝的解析接口，换取带 token + eid 的 playable_url（需登录态 Cookie）；
     2. 用 token + eid 调 finder-preview 的 get_feed_info 接口，
        拿到明文可播的视频直链 (h264VideoInfo.videoUrl)。
 
