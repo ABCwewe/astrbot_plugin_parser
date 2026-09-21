@@ -60,7 +60,7 @@ class MetubeParser(BaseParser):
     @property
     def api_base(self) -> str:
         """Metube 服务地址（去除尾部斜杠）。API 通常位于内网，不走代理"""
-        return (self.mycfg.metube_url or "http://192.168.1.202:8081").rstrip("/")
+        return (self.mycfg.metube_url or "http://127.0.0.1:8081").rstrip("/")
 
     @property
     def api(self) -> ClientSession:

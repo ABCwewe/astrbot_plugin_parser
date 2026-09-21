@@ -729,9 +729,9 @@
                     },
                     "metube_url": {
                         "description": "Metube 服务地址",
-                        "hint": "如 http://192.168.1.202:8081。若 Metube 部署在反代子路径（URL_PREFIX），需带上路径，如 http://host:8081/metube",
+                        "hint": "如 http://127.0.0.1:8081。若 Metube 部署在反代子路径（URL_PREFIX），需带上路径，如 http://host:8081/metube",
                         "type": "string",
-                        "default": "http://192.168.1.202:8081"
+                        "default": "http://127.0.0.1:8081"
                     },
                     "video_quality": {
                         "description": "清晰度上限",
