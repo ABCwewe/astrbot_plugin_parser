@@ -164,7 +164,6 @@ class ParserItem(ConfigNode):
     video_codec: str | None
     video_format: str | None
     metube_url: str | None
-    add_timeout: int | None
     wait_timeout: int | None
     delete_after_fetch: bool | None
     nsfw: str | None

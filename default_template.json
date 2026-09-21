@@ -44,7 +44,6 @@
     "enable": false,
     "use_proxy": false,
     "metube_url": "http://192.168.1.202:8081",
-    "add_timeout": 60,
     "video_quality": "720",
     "video_codec": "h264",
     "video_format": "mp4",

@@ -1,18 +1,21 @@
 import asyncio
 import re
+import time
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
+import aiofiles
 import yt_dlp
 from aiohttp import ClientError, ClientSession, ClientTimeout
 
 from astrbot.api import logger
 
 from ..config import PluginConfig
+from ..data import VideoContent
 from ..download import Downloader
 from ..exception import DownloadException, SizeLimitException
-from ..utils import generate_file_name
+from ..utils import generate_file_name, safe_unlink
 from .base import BaseParser, Platform, handle
 
 
@@ -61,11 +64,9 @@ class MetubeParser(BaseParser):
 
     @property
     def api(self) -> ClientSession:
-        """访问 Metube API 的独立会话，与代理无关"""
+        """访问 Metube API 的独立会话（无会话级超时，由管线截止时间统一约束）"""
         if self._api is None or self._api.closed:
-            self._api = ClientSession(
-                timeout=ClientTimeout(total=self.cfg.common_timeout)
-            )
+            self._api = ClientSession(timeout=ClientTimeout(total=None))
         return self._api
 
     async def close_session(self) -> None:
@@ -74,15 +75,8 @@ class MetubeParser(BaseParser):
             self._api = None
         await super().close_session()
 
-    async def _request_json(
-        self, method: str, path: str, timeout: int | None = None, **kwargs
-    ) -> dict:
-        """请求 Metube API 并解析 JSON 响应
-
-        timeout 为 None 时使用会话默认超时（common_timeout）
-        """
-        if timeout:
-            kwargs["timeout"] = ClientTimeout(total=timeout)
+    async def _request_json(self, method: str, path: str, **kwargs) -> dict:
+        """请求 Metube API 并解析 JSON 响应（无单请求超时，调用方用管线截止时间约束）"""
         async with self.api.request(
             method, f"{self.api_base}{path}", **kwargs
         ) as resp:
@@ -97,6 +91,19 @@ class MetubeParser(BaseParser):
         return item.get("url") == submit_url or (
             bool(video_id) and item.get("id") == video_id
         )
+
+    @staticmethod
+    def _normalize_ts(ts) -> float:
+        """Metube 入队时间戳归一化为秒级 epoch（兼容 ns/ms/s 精度）"""
+        try:
+            ts = float(ts)
+        except (TypeError, ValueError):
+            return 0.0
+        if ts > 1e17:  # 纳秒
+            ts /= 1e9
+        elif ts > 1e14:  # 毫秒
+            ts /= 1e3
+        return ts
 
     async def _find_history_entry(
         self, submit_url: str, video_id: str | None
@@ -113,47 +120,61 @@ class MetubeParser(BaseParser):
             return None
         return max(candidates, key=lambda i: i.get("timestamp") or 0)
 
+    @staticmethod
+    def _cache_name(video_id: str | None) -> str | None:
+        """缓存文件名：仅用视频 ID，命中即跳过整条管线与元数据提取"""
+        return f"{video_id}.mp4" if video_id else None
+
     async def _wait_finished(
         self,
         submit_url: str,
         video_id: str | None,
-        add_task: asyncio.Task | None = None,
+        add_task: asyncio.Task,
+        deadline: float,
     ) -> dict:
-        """轮询 /history 直到任务真正完成
+        """轮询 /history 直到任务真正完成（受管线截止时间约束，无单请求超时）
 
         Metube 的 /add 会同步解析链接后才入队并响应 {'status': 'ok'}，
         解析期间条目尚未出现，因此不能依赖 /add 的响应时序：
-        - /add 响应 error → 快速失败；连接异常 → 服务异常；
-          响应超时 → 不致命（Metube 侧仍在解析），以条目出现为准
-        - /add 响应 ok 后条目仍消失 → 任务被删除
+        - /add 响应 error → 快速失败；连接异常 → 服务异常
+        - done 队列按 URL 键存储且可能残留同 URL 的历史条目，
+          仅采信入队时间晚于本次提交时刻（含时钟容差）的条目
         - status=finished 会为每个下载流各触发一次（如 .f133.mp4 纯视频流），
           条目从 queue 移入 done 才代表合并/后处理全部结束
         """
         timeout = self.mycfg.wait_timeout or 600
-        deadline = asyncio.get_running_loop().time() + timeout
+        submit_epoch = time.time()
         add_ok = False
         while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise DownloadException(f"等待 Metube 下载超时({timeout}秒)")
+
             # /add 已完成时优先处理其结果
-            if add_task is not None and add_task.done():
+            if add_task.done():
                 exc = add_task.exception()
                 if exc is not None:
-                    if isinstance(exc, TimeoutError):
-                        pass  # 响应超时不致命，Metube 侧仍在解析
-                    else:
-                        raise DownloadException(f"Metube 服务异常: {exc}") from exc
-                else:
-                    resp = add_task.result()
-                    if resp.get("status") != "ok":
-                        logger.warning(
-                            f"[metube] 添加任务被拒绝: "
-                            f"{resp.get('msg') or resp} | {submit_url}"
-                        )
-                        raise DownloadException(
-                            f"Metube 添加任务失败: {resp.get('msg') or resp}"
-                        )
-                    add_ok = True
+                    raise DownloadException(f"Metube 服务异常: {exc}") from exc
+                resp = add_task.result()
+                if resp.get("status") != "ok":
+                    logger.warning(
+                        f"[metube] 添加任务被拒绝: "
+                        f"{resp.get('msg') or resp} | {submit_url}"
+                    )
+                    raise DownloadException(
+                        f"Metube 添加任务失败: {resp.get('msg') or resp}"
+                    )
+                add_ok = True
 
-            history = await self._request_json("GET", "/history")
+            try:
+                history = await asyncio.wait_for(
+                    self._request_json("GET", "/history"), remaining
+                )
+            except TimeoutError:
+                raise DownloadException(
+                    f"等待 Metube 下载超时({timeout}秒)"
+                ) from None
+
             live = next(
                 (
                     item
@@ -169,9 +190,7 @@ class MetubeParser(BaseParser):
                         f"Metube 下载失败: "
                         f"{live.get('msg') or live.get('error') or '未知错误'}"
                     )
-            elif add_ok or add_task is None:
-                # done 按 URL 键存储。仅在 /add 确认入队后才采信 done 条目，
-                # 避免解析期间被同 URL 的历史条目（旧错误/旧完成）误导
+            else:
                 entry = next(
                     (
                         item
@@ -180,7 +199,11 @@ class MetubeParser(BaseParser):
                     ),
                     None,
                 )
-                if entry is not None:
+                # 仅采信本次提交之后入队的 done 条目，历史残留继续等待
+                fresh = entry is not None and self._normalize_ts(
+                    entry.get("timestamp")
+                ) >= submit_epoch - 60
+                if entry is not None and fresh:
                     if entry.get("status") == "error":
                         raise DownloadException(
                             f"Metube 下载失败: "
@@ -188,24 +211,36 @@ class MetubeParser(BaseParser):
                         )
                     if entry.get("filename"):
                         return entry
-                else:
+                elif add_ok:
+                    # 已确认入队却无在队/新鲜条目 → 任务被删除
                     raise DownloadException("Metube 任务不存在或已被删除")
-            # /add 尚未确认入队 → Metube 仍在解析，继续等待（忽略历史条目）
+                # 其余情况: Metube 仍在解析或仅有历史残留 → 继续等待
             if asyncio.get_running_loop().time() >= deadline:
                 raise DownloadException(f"等待 Metube 下载超时({timeout}秒)")
             await asyncio.sleep(self.POLL_INTERVAL)
 
     async def _delete_download(self, download_id: str, where: str) -> None:
-        """删除 Metube 下载记录（尽力而为）"""
+        """删除 Metube 下载记录（尽力而为；清理动作 15 秒封顶防止挂起）"""
         try:
-            await self._request_json(
-                "POST", "/delete", json={"ids": [download_id], "where": where}
+            await asyncio.wait_for(
+                self._request_json(
+                    "POST", "/delete", json={"ids": [download_id], "where": where}
+                ),
+                15,
             )
         except (ClientError, TimeoutError) as e:
             logger.warning(f"[metube] 删除记录 {download_id} 失败: {e}")
 
-    async def _download_via_metube(self, url: str, quality: str | None = None) -> Path:
-        """提交链接给 Metube，等待完成后把视频取回到缓存目录"""
+    async def _download_via_metube(
+        self, url: str, quality: str | None = None, cache_name: str | None = None
+    ) -> Path:
+        """提交链接给 Metube，等待完成后把视频取回到缓存目录
+
+        整条管线（提交→解析等待→下载→取回）共用 wait_timeout 一个截止时间，
+        内部请求不设单独超时
+        """
+        timeout = self.mycfg.wait_timeout or 600
+        deadline = asyncio.get_running_loop().time() + timeout
         submit_url = self._strip_timestamp_param(url)
         payload = {
             "url": submit_url,
@@ -215,16 +250,11 @@ class MetubeParser(BaseParser):
             "format": self.mycfg.video_format or "mp4",
             "auto_start": True,
         }
-        # /add 会同步解析链接后才响应，慢代理下可能超过普通超时。
+        # /add 会同步解析链接后才响应，慢代理下可能长时间无响应。
         # 因此把请求放入后台任务、不阻塞等待响应，以 /history 中任务条目
-        # 的出现为准；/add 的 error 状态仅用于快速失败，响应超时由轮询兜底
+        # 的出现为准；/add 的 error 状态仅用于快速失败
         add_task = asyncio.create_task(
-            self._request_json(
-                "POST",
-                "/add",
-                timeout=self.mycfg.add_timeout or 60,
-                json=payload,
-            )
+            self._request_json("POST", "/add", json=payload)
         )
         video_id = (
             match.group(1) if (match := self.VIDEO_ID_RE.search(submit_url)) else None
@@ -234,7 +264,9 @@ class MetubeParser(BaseParser):
         )
 
         try:
-            finished = await self._wait_finished(submit_url, video_id, add_task)
+            finished = await self._wait_finished(
+                submit_url, video_id, add_task, deadline
+            )
             # 第二层限制：Metube 已完成下载，实际体积超限则不取回，直接清理
             size = finished.get("size")
             if isinstance(size, (int, float)) and size > self.cfg.max_size:
@@ -244,34 +276,75 @@ class MetubeParser(BaseParser):
             filename = finished.get("filename")
             if not filename:
                 raise DownloadException("Metube 未返回下载文件名")
-            # Metube 完成文件的静态端点，流式下载落盘（受 source_max_size 限制）
+            # Metube 完成文件的静态端点
             file_url = f"{self.api_base}/download/{quote(str(filename))}"
-            file_name = generate_file_name(file_url, ".mp4")
-            video_path = await self.downloader.streamd(
-                file_url, file_name=file_name, proxy=None
-            )
+            file_name = cache_name or generate_file_name(file_url, ".mp4")
+            video_path = await self._fetch_file(file_url, file_name, deadline)
         except (DownloadException, ClientError, TimeoutError) as e:
             logger.warning(f"[metube] 下载流程失败: {e} | {url}")
-            # 取消仍在排队的任务，避免孤儿下载。
-            # done/queue 队列以规范化 URL 为键，必须从条目取 url，不能用视频ID
+            # 尽力取消 Metube 侧任务，避免孤儿下载：
+            # - 条目已在队列/下载中 → 按条目 URL 取消（可终止下载进程）
+            # - 仍在解析（条目未入队） → 按规范化 URL 预取消，
+            #   Metube 解析完成后会检查 _canceled_urls 拒绝入队
+            # done/queue 队列以规范化 URL 为键，必须用 URL，不能用视频ID
             try:
-                entry = await self._find_history_entry(submit_url, video_id)
+                entry = await asyncio.wait_for(
+                    self._find_history_entry(submit_url, video_id), 15
+                )
             except (ClientError, TimeoutError):
                 entry = None
+            cancelled: set[str] = set()
             if entry and entry.get("url"):
                 await self._delete_download(entry["url"], "queue")
+                cancelled.add(entry["url"])
+            if video_id:
+                canonical = f"https://www.youtube.com/watch?v={video_id}"
+                if canonical not in cancelled:
+                    await self._delete_download(canonical, "queue")
             if isinstance(e, DownloadException):
                 raise
             raise DownloadException(f"Metube 服务异常: {e}") from e
         finally:
-            # 回收 /add 任务的异常，避免 asyncio 报未检索异常
-            add_task.add_done_callback(
-                lambda t: None if t.cancelled() else t.exception()
-            )
+            # 管线结束（含失败）时回收 /add 请求：未完成则取消，异常则吞掉
+            if add_task.done():
+                add_task.exception()
+            else:
+                add_task.cancel()
         # 拉取成功后按需清理记录，DELETE_FILE_ON_TRASHCAN=true 时会同时删除服务端文件
         if self.mycfg.delete_after_fetch and finished.get("url"):
             await self._delete_download(finished["url"], "done")
         return video_path
+
+    async def _fetch_file(
+        self, file_url: str, file_name: str, deadline: float
+    ) -> Path:
+        """从 Metube 静态端点取回完成文件到缓存目录（受管线截止时间约束）"""
+        file_path = self.cfg.cache_dir / file_name
+        if file_path.exists():
+            return file_path
+
+        async def _do() -> None:
+            async with self.api.get(file_url) as resp:
+                if resp.status >= 400:
+                    raise DownloadException(
+                        f"取回失败: HTTP {resp.status} {resp.reason}"
+                    )
+                async with aiofiles.open(file_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(1024 * 1024):
+                        await f.write(chunk)
+
+        remaining = deadline - asyncio.get_running_loop().time()
+        try:
+            await asyncio.wait_for(_do(), remaining)
+        except TimeoutError:
+            await safe_unlink(file_path)
+            raise DownloadException(
+                f"等待 Metube 下载超时({self.mycfg.wait_timeout or 600}秒)"
+            ) from None
+        except ClientError as e:
+            await safe_unlink(file_path)
+            raise DownloadException(f"从 Metube 取回视频失败: {e}") from e
+        return file_path
 
     @staticmethod
     def _strip_timestamp_param(url: str) -> str:
@@ -299,10 +372,23 @@ class MetubeParser(BaseParser):
     async def parse_video(self, searched: re.Match[str]):
         # 从匹配对象中获取原始URL
         url = searched.group(0)
+        video_id = (
+            match.group(1) if (match := self.VIDEO_ID_RE.search(url)) else None
+        )
+        cache_name = self._cache_name(video_id)
+
+        # 缓存判断：仅比对视频 ID，命中即直接发送本地缓存
+        # （不提取元数据、不提交 Metube）
+        if cache_name:
+            cache_path = self.cfg.cache_dir / cache_name
+            if cache_path.exists():
+                logger.info(f"[metube] 命中缓存: {cache_name}")
+                return self.result(contents=[VideoContent(cache_path)])
 
         # 第一层限制：本地提取元数据，时长超限直接拒绝；
         # 体积按清晰度上限逐级回退，选出不撞墙的最高档
         quality: str | None = None
+        duration = 0.0
         raw = await self._extract_video_meta(url)
         if raw is not None:
             duration = float(raw.get("duration") or 0)
@@ -337,12 +423,13 @@ class MetubeParser(BaseParser):
 
         # 提交 Metube 并在后台等待下载完成（元信息缺失时完全交由 Metube 处理）
         video_task = asyncio.create_task(
-            self._download_via_metube(url, quality=quality), name=f"metube | {url}"
+            self._download_via_metube(url, quality=quality, cache_name=cache_name),
+            name=f"metube | {url}",
         )
         contents = [
             self.create_video_content_by_task(
                 video_task,
-                duration=float(raw.get("duration") or 0) if raw else 0.0,
+                duration=duration,
             )
         ]
         return self.result(
