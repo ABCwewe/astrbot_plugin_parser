@@ -380,8 +380,10 @@ class MetubeParser(BaseParser):
         return await self.parse_video(searched)
 
     async def parse_video(self, searched: re.Match[str]):
-        # 从匹配对象中获取原始URL
+        # 从匹配对象中获取原始URL；两个匹配模式均从域名开始，需补全协议
         url = searched.group(0)
+        if not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
         video_id = (
             match.group(1) if (match := self.VIDEO_ID_RE.search(url)) else None
         )
