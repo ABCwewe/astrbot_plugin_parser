@@ -718,7 +718,7 @@
                     "enable": {
                         "description": "启用",
                         "type": "bool",
-                        "default": false,
+                        "default": true,
                         "hint": "启用后接管 YouTube 视频链接的解析（改为提交给 Metube 下载）；音频（ym 前缀）仍走原油管解析器"
                     },
                     "use_proxy": {
